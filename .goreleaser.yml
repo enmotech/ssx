@@ -28,6 +28,21 @@ archives:
     files:
       - LICENSE
       - README.md
+checksum:
+  name_template: "checksums.txt"
+brews:
+  - name: ssx
+    repository:
+      owner: enmotech
+      name: homebrew-tap
+      branch: main
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    directory: Formula
+    homepage: "https://github.com/enmotech/ssx"
+    description: "Retentive ssh client with persistent connection entries"
+    license: MIT
+    test: |
+      system "#{bin}/ssx", "--version"
 snapshot:
   name_template: "{{ incpatch .Version }}-preview"
 changelog:

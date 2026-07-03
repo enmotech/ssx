@@ -3,27 +3,166 @@ name: Release
 on:
   push:
     tags:
-      - '*'
+      # GitHub Actions uses glob patterns here, not regex. Match versioned
+      # tags broadly at the trigger layer, then enforce strict semver below.
+      - "v*.*.*"
+      - "!v*-dirty*"
+
+permissions:
+  contents: write
+  packages: write
 
 jobs:
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      tag_name: ${{ steps.release_meta.outputs.tag_name }}
+      is_stable: ${{ steps.release_meta.outputs.is_stable }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Ensure tag is on main branch
+        shell: bash
+        run: |
+          # Verify the tagged commit is reachable from the main branch
+          if ! git branch -r --contains "$GITHUB_SHA" | grep -q 'origin/main'; then
+            echo "::error::Release tags must be on the main branch. This commit is not reachable from origin/main."
+            exit 1
+          fi
+
+      - name: Validate tag name
+        id: release_meta
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          echo "Triggered by tag: $tag"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Release tags must look like vX.Y.Z or vX.Y.Z-suffix; got '$tag'."
+            exit 1
+          fi
+          if [[ "$tag" == *-dirty* ]]; then
+            echo "::error::Refusing to release from dirty tag '$tag'."
+            exit 1
+          fi
+          echo "tag_name=$tag" >> "$GITHUB_OUTPUT"
+          if [[ "$tag" == *-* ]]; then
+            echo "is_stable=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_stable=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Run tests
+        run: go test ./...
+
   release:
+    needs: verify
+    # Only run on the enmotech fork.
+    if: github.repository_owner == 'enmotech' || github.repository_owner == 'kamusis'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Fetch all tags
-        run: git fetch --force --tags
-      - name: Set up Go
-        uses: actions/setup-go@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
         with:
-          go-version: 1.23.1
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
       - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v4
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          distribution: goreleaser
-          version: "~> v2"
-          args: release --clean --timeout=60m
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+
+      - name: Generate version.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.verify.outputs.tag_name }}"
+          VERSION="${TAG#v}"
+          DOWNLOAD_BASE="https://${{ secrets.OSS_BUCKET }}.${{ secrets.OSS_ENDPOINT }}/tools/ssx"
+          cat > dist/version.json <<EOF
+          {
+            "version": "${VERSION}",
+            "tag": "${TAG}",
+            "release_url": "https://github.com/${{ github.repository }}/releases/tag/${TAG}",
+            "download_base": "${DOWNLOAD_BASE}",
+            "downloads": {
+              "linux_amd64": "${DOWNLOAD_BASE}/${VERSION}/ssx_${TAG}_linux_x86_64.tar.gz",
+              "linux_arm64": "${DOWNLOAD_BASE}/${VERSION}/ssx_${TAG}_linux_arm64.tar.gz",
+              "darwin_amd64": "${DOWNLOAD_BASE}/${VERSION}/ssx_${TAG}_darwin_x86_64.tar.gz",
+              "darwin_arm64": "${DOWNLOAD_BASE}/${VERSION}/ssx_${TAG}_darwin_arm64.tar.gz",
+              "windows_amd64": "${DOWNLOAD_BASE}/${VERSION}/ssx_${TAG}_windows_x86_64.zip"
+            },
+            "checksums_url": "${DOWNLOAD_BASE}/${VERSION}/checksums.txt"
+          }
+          EOF
+
+      - name: Upload to OSS
+        shell: bash
+        env:
+          OSS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
+          OSS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+          OSS_BUCKET: ${{ secrets.OSS_BUCKET }}
+          OSS_ENDPOINT: ${{ secrets.OSS_ENDPOINT }}
+          TAG: ${{ needs.verify.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+
+          oss_put() {
+            local local_path="$1"
+            local oss_key="$2"
+            local content_type="${3:-application/octet-stream}"
+            local cache_control="${4:-}"
+
+            local date
+            date=$(LC_ALL=C date -u +"%a, %d %b %Y %H:%M:%S GMT")
+            local string_to_sign="PUT\n\n${content_type}\n${date}\n/${OSS_BUCKET}/${oss_key}"
+            local signature
+            signature=$(printf "${string_to_sign}" | openssl dgst -sha1 -hmac "${OSS_KEY_SECRET}" -binary | base64)
+
+            local extra_headers=()
+            if [[ -n "${cache_control}" ]]; then
+              extra_headers+=(-H "Cache-Control: ${cache_control}")
+            fi
+
+            local http_code
+            http_code=$(curl -s -o /tmp/oss_resp.txt -w "%{http_code}" \
+              -X PUT \
+              -H "Date: ${date}" \
+              -H "Content-Type: ${content_type}" \
+              -H "Authorization: OSS ${OSS_KEY_ID}:${signature}" \
+              "${extra_headers[@]}" \
+              --data-binary "@${local_path}" \
+              "https://${OSS_BUCKET}.${OSS_ENDPOINT}/${oss_key}")
+
+            if [[ "${http_code}" != "200" ]]; then
+              echo "::error::OSS upload failed [${http_code}] for ${oss_key}: $(cat /tmp/oss_resp.txt)"
+              exit 1
+            fi
+            echo "  uploaded ${oss_key} [${http_code}]"
+          }
+
+          for f in dist/*.tar.gz dist/*.zip dist/checksums.txt; do
+            [[ -f "$f" ]] || continue
+            oss_put "$f" "tools/ssx/${VERSION}/$(basename $f)"
+          done
+
+          oss_put "dist/version.json" "tools/ssx/version.json" \
+            "application/json" "no-cache, no-store"
